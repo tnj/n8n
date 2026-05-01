@@ -38,6 +38,9 @@ jobs:
         id: sha
         run: echo "short=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
       - name: Build n8n (compiled/)
         run: node scripts/build-n8n.mjs
         env:
