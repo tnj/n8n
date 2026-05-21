@@ -79,6 +79,54 @@ const modelField: INodeProperties = {
 
 const MIN_THINKING_BUDGET = 1024;
 const DEFAULT_MAX_TOKENS = 4096;
+
+// Claude 2.x and Claude Instant do not support Anthropic prompt caching.
+// All Claude 3.x and 4.x models support it.
+const NON_CACHEABLE_MODEL_RE = /^claude-(2|instant)/i;
+
+// `ephemeral` is the 5-minute TTL cache class. @langchain/anthropic reads `cache_control`
+// from the call options and attaches it to the last content block of the last message
+// (see its `applyCacheControlToPayload`), caching the request prefix (system + tools +
+// history) for subsequent invocations.
+const CACHE_CONTROL_EPHEMERAL = { type: 'ephemeral' as const };
+
+// We inject `cache_control` by wrapping the instance's generation methods rather than
+// calling `model.bind({ cache_control })`: downstream agents call `bindTools()` on the
+// returned model, and the `RunnableBinding` that `.bind()` returns has no such method.
+// `_generate` / `_streamResponseChunks` are LangChain's documented BaseChatModel
+// extension points, and wrapping the instance keeps it a real `ChatAnthropic`.
+function applyPromptCaching(model: ChatAnthropic, modelName: string): void {
+	if (NON_CACHEABLE_MODEL_RE.test(modelName)) return;
+
+	// Only patch when the extension points are present. Real ChatAnthropic instances always
+	// have them; this guards against future API changes (and mocked instances in tests).
+	if (
+		typeof model._generate !== 'function' ||
+		typeof model._streamResponseChunks !== 'function'
+	) {
+		return;
+	}
+
+	const originalGenerate = model._generate.bind(model);
+	const originalStream = model._streamResponseChunks.bind(model);
+
+	model._generate = async (messages, options, runManager) =>
+		await originalGenerate(
+			messages,
+			// Preserve caller-supplied cache_control if present (e.g. a custom 1h TTL).
+			{ ...options, cache_control: options.cache_control ?? CACHE_CONTROL_EPHEMERAL },
+			runManager,
+		);
+
+	model._streamResponseChunks = async function* (messages, options, runManager) {
+		yield* originalStream(
+			messages,
+			{ ...options, cache_control: options.cache_control ?? CACHE_CONTROL_EPHEMERAL },
+			runManager,
+		);
+	};
+}
+
 export class LmChatAnthropic implements INodeType {
 	methods = {
 		listSearch: {
@@ -587,6 +635,8 @@ export class LmChatAnthropic implements INodeType {
 		}
 
 		const model = new ChatAnthropic(chatAnthropicParams);
+
+		applyPromptCaching(model, modelName);
 
 		// Some Anthropic models do not support Langchain default of -1 for topP so we need to unset it
 		if (options.topP === undefined) {

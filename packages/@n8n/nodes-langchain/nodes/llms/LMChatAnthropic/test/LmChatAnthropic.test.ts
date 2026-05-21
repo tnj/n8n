@@ -837,4 +837,98 @@ describe('LmChatAnthropic', () => {
 			});
 		});
 	});
+
+	describe('prompt caching', () => {
+		type GenerateArgs = Parameters<ChatAnthropic['_generate']>;
+		type GenerateOptions = GenerateArgs[1];
+
+		const supplyModelWith = async (
+			modelValue: string,
+			methods: {
+				_generate: ReturnType<typeof vi.fn>;
+				_streamResponseChunks: ReturnType<typeof vi.fn>;
+			},
+		): Promise<ChatAnthropic> => {
+			const mockContext = setupMockContext({ typeVersion: 1.3 });
+			mockContext.getNodeParameter = vi.fn().mockImplementation((paramName: string) => {
+				if (paramName === 'model.value') return modelValue;
+				if (paramName === 'options') return {};
+				return undefined;
+			});
+			createMockModel(methods as unknown as Partial<ChatAnthropic>);
+			const { response } = await lmChatAnthropic.supplyData.call(mockContext, 0);
+			return response as ChatAnthropic;
+		};
+
+		it('injects ephemeral cache_control into _generate options for a cacheable model', async () => {
+			const generateSpy = vi.fn().mockResolvedValue({ generations: [] });
+			const model = await supplyModelWith('claude-sonnet-4-20250514', {
+				_generate: generateSpy,
+				_streamResponseChunks: vi.fn(),
+			});
+
+			await model._generate([], { stop: ['x'] } as GenerateOptions, undefined);
+
+			expect(generateSpy).toHaveBeenCalledWith(
+				[],
+				expect.objectContaining({ stop: ['x'], cache_control: { type: 'ephemeral' } }),
+				undefined,
+			);
+		});
+
+		it('injects ephemeral cache_control into _streamResponseChunks options', async () => {
+			const streamSpy = vi.fn(function* () {
+				yield {} as never;
+			});
+			const model = await supplyModelWith('claude-sonnet-4-20250514', {
+				_generate: vi.fn(),
+				_streamResponseChunks: streamSpy,
+			});
+
+			const iterator = model._streamResponseChunks([], {} as GenerateOptions, undefined);
+			await iterator.next();
+
+			expect(streamSpy).toHaveBeenCalledWith(
+				[],
+				expect.objectContaining({ cache_control: { type: 'ephemeral' } }),
+				undefined,
+			);
+		});
+
+		it('preserves caller-supplied cache_control instead of overriding it', async () => {
+			const generateSpy = vi.fn().mockResolvedValue({ generations: [] });
+			const model = await supplyModelWith('claude-sonnet-4-20250514', {
+				_generate: generateSpy,
+				_streamResponseChunks: vi.fn(),
+			});
+
+			await model._generate(
+				[],
+				{ cache_control: { type: 'ephemeral', ttl: '1h' } } as GenerateOptions,
+				undefined,
+			);
+
+			expect(generateSpy).toHaveBeenCalledWith(
+				[],
+				expect.objectContaining({ cache_control: { type: 'ephemeral', ttl: '1h' } }),
+				undefined,
+			);
+		});
+
+		it.each(['claude-2.1', 'claude-instant-1.2'])(
+			'does not inject cache_control for non-cacheable model %s',
+			async (modelValue) => {
+				const generateSpy = vi.fn().mockResolvedValue({ generations: [] });
+				const model = await supplyModelWith(modelValue, {
+					_generate: generateSpy,
+					_streamResponseChunks: vi.fn(),
+				});
+
+				await model._generate([], {} as GenerateOptions, undefined);
+
+				expect(generateSpy).toHaveBeenCalledTimes(1);
+				expect(generateSpy.mock.calls[0][1]).not.toHaveProperty('cache_control');
+			},
+		);
+	});
 });
